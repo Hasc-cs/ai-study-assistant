@@ -28,8 +28,7 @@ from pypdf.errors import PdfReadError
 
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-import chromadb
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
 # --------------------------------------------------------------------------
@@ -174,15 +173,12 @@ def chunk_documents(
 # --------------------------------------------------------------------------
 # 3. Vector Store
 # --------------------------------------------------------------------------
-
 def build_vector_store(
     chunks: List[Document],
     api_key: str,
     persist_directory: Optional[str] = None,
-) -> Chroma:
-    """
-    Build an in-memory Chroma vector store directly from chunks.
-    """
+):
+    """Build an in-memory FAISS vector store directly from chunks."""
     if not api_key:
         raise VectorStoreError("A Gemini API key is required to build embeddings.")
 
@@ -191,8 +187,7 @@ def build_vector_store(
             model=EMBEDDING_MODEL,
             google_api_key=api_key,
         )
-
-        vector_store = Chroma.from_documents(
+        vector_store = FAISS.from_documents(
             documents=chunks,
             embedding=embeddings,
         )
@@ -204,19 +199,6 @@ def build_vector_store(
             f"connection. Details: {exc}"
         ) from exc
 
-def get_llm(api_key: str, temperature: float = 0.3) -> ChatGoogleGenerativeAI:
-    """Instantiate the Gemini chat model."""
-    if not api_key:
-        raise GenerationError("A Gemini API key is required to use the language model.")
-    try:
-        return ChatGoogleGenerativeAI(
-            model=LLM_MODEL,
-            google_api_key=api_key,
-            temperature=temperature,
-            convert_system_message_to_human=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise GenerationError(f"Failed to initialize Gemini model: {exc}") from exc
 
 
 # --------------------------------------------------------------------------
@@ -311,7 +293,7 @@ ANSWER:"""
 # --------------------------------------------------------------------------
 
 def _gather_context(
-    vector_store: Chroma,
+    vector_store,
     topic: Optional[str],
     k: int = 8,
 ) -> str:
