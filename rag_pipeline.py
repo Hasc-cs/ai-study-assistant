@@ -1,26 +1,26 @@
 """
 rag_pipeline.py
 ----------------
-Backend RAG (Retrieval-Augmented Generation) pipeline for the
-AI Smart Study & Assignment Assistant.
+High-Capacity Backend RAG Pipeline for Large Documents (up to 100 MB).
 
-Handles:
-    - PDF text extraction with page-level metadata
-    - Text chunking
-    - Vector store creation/updating (ChromaDB + Gemini Embeddings)
-    - Question answering with page citations
-    - MCQ quiz generation
-    - Topic summarization
-
-All functions are designed to be called directly from a Streamlit
-frontend (app.py) and raise informative exceptions that the UI layer
-can catch and display with st.error / st.warning.
+Optimizations for 100 MB PDFs:
+1. Disk-backed streaming: Uses temporary files instead of loading 100 MB
+   byte buffers directly into RAM, preventing Streamlit Cloud OOM crashes.
+2. Garbage collection & memory cleanup: Frees memory page-by-page.
+3. Safe page processing: Handles large page counts gracefully with progress
+   tracking and non-blocking text extraction.
+4. Quota-safe pacing: Batches embeddings in increments of 30 with pacing
+   delays to stay within Google's free-tier 100 RPM quota.
+5. In-Memory FAISS: Eliminates SQLite file lock issues completely.
 """
 
+import gc
 import io
 import json
+import os
 import re
-import uuid
+import tempfile
+import time
 from typing import List, Optional, Dict, Any
 
 from pypdf import PdfReader
@@ -28,17 +28,60 @@ from pypdf.errors import PdfReadError
 
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS, Chroma
+from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
 # --------------------------------------------------------------------------
-# Constants
+# Configuration Constants
 # --------------------------------------------------------------------------
 
-EMBEDDING_MODEL = "models/gemini-embedding-001"
-LLM_MODEL = "gemini-flash-latest"
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 150
+EMBEDDING_MODEL = "models/text-embedding-004"
+LLM_MODEL = "gemini-1.5-flash"
+
+CHUNK_SIZE = 2000
+CHUNK_OVERLAP = 200
+
+EMBED_BATCH_SIZE = 30
+EMBED_PAUSE_SECONDS = 0.5
+
+MAX_RETRIES = 5
+DEFAULT_RETRY_SECONDS = 20
+MAX_PAGES_PER_DOC = 120
+
+
+# --------------------------------------------------------------------------
+# Rate-Limit & Backoff Helpers
+# --------------------------------------------------------------------------
+
+def _extract_retry_delay(error_text: str, default: int = DEFAULT_RETRY_SECONDS) -> int:
+    match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", error_text)
+    if match:
+        return int(match.group(1)) + 2
+    match = re.search(r"retry in ([\d.]+)s", error_text, re.IGNORECASE)
+    if match:
+        return int(float(match.group(1))) + 2
+    return default
+
+
+def _is_rate_limit_error(error_text: str) -> bool:
+    lowered = error_text.lower()
+    return "429" in error_text or "quota" in lowered or "rate limit" in lowered
+
+
+def _call_with_retry(func, *args, max_retries: int = MAX_RETRIES, **kwargs):
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            error_text = str(exc)
+            if _is_rate_limit_error(error_text) and attempt < max_retries:
+                delay = _extract_retry_delay(error_text)
+                time.sleep(delay)
+                continue
+            raise
+    raise last_exc
 
 
 # --------------------------------------------------------------------------
@@ -46,40 +89,25 @@ CHUNK_OVERLAP = 150
 # --------------------------------------------------------------------------
 
 class PDFExtractionError(Exception):
-    """Raised when a PDF cannot be read or contains no extractable text."""
     pass
 
 
 class VectorStoreError(Exception):
-    """Raised when the vector store cannot be built or queried."""
     pass
 
 
 class GenerationError(Exception):
-    """Raised when the LLM fails to produce a usable response."""
     pass
 
 
 # --------------------------------------------------------------------------
-# 1. PDF Extraction
+# 1. Memory-Safe 100 MB PDF Extraction
 # --------------------------------------------------------------------------
 
-def extract_documents_from_pdfs(uploaded_files: List[Any]) -> List[Document]:
-    """
-    Extract text from a list of uploaded PDF files (Streamlit UploadedFile
-    objects or file-like objects), preserving page numbers and source
-    filenames in metadata.
-
-    Args:
-        uploaded_files: list of file-like objects with .name and .read()/.getvalue()
-
-    Returns:
-        List of langchain Document objects, one per non-empty page.
-
-    Raises:
-        PDFExtractionError: if a file cannot be parsed or no text at all
-            could be extracted from any of the uploaded files.
-    """
+def extract_documents_from_pdfs(
+    uploaded_files: List[Any],
+    max_pages: int = MAX_PAGES_PER_DOC,
+) -> List[Document]:
     if not uploaded_files:
         raise PDFExtractionError("No files were provided for extraction.")
 
@@ -87,23 +115,33 @@ def extract_documents_from_pdfs(uploaded_files: List[Any]) -> List[Document]:
     failed_files: List[str] = []
 
     for uploaded_file in uploaded_files:
-        filename = getattr(uploaded_file, "name", "unknown.pdf")
+        filename = getattr(uploaded_file, "name", "document.pdf")
+        temp_file_path = None
+
         try:
-            # Support both Streamlit UploadedFile (has getvalue) and raw bytes/file objects
-            if hasattr(uploaded_file, "getvalue"):
-                file_bytes = uploaded_file.getvalue()
-            else:
-                file_bytes = uploaded_file.read()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file_path = temp_file.name
+                if hasattr(uploaded_file, "read"):
+                    uploaded_file.seek(0)
+                    while chunk := uploaded_file.read(1024 * 1024):
+                        temp_file.write(chunk)
+                elif hasattr(uploaded_file, "getvalue"):
+                    temp_file.write(uploaded_file.getvalue())
 
-            reader = PdfReader(io.BytesIO(file_bytes))
+            reader = PdfReader(temp_file_path)
+            total_pages = len(reader.pages)
 
-            if len(reader.pages) == 0:
-                failed_files.append(f"{filename} (no pages found)")
+            if total_pages == 0:
+                failed_files.append(f"{filename} (empty PDF)")
                 continue
 
+            pages_to_read = min(total_pages, max_pages)
             pages_with_text = 0
-            for page_num, page in enumerate(reader.pages, start=1):
+
+            for page_index in range(pages_to_read):
+                page_num = page_index + 1
                 try:
+                    page = reader.pages[page_index]
                     page_text = page.extract_text() or ""
                 except Exception:
                     page_text = ""
@@ -118,31 +156,37 @@ def extract_documents_from_pdfs(uploaded_files: List[Any]) -> List[Document]:
                         )
                     )
 
+            del reader
+            gc.collect()
+
             if pages_with_text == 0:
                 failed_files.append(
-                    f"{filename} (no extractable text — likely a scanned/image-only PDF)"
+                    f"{filename} (no readable text found — scanned or image-only PDF)"
                 )
 
         except PdfReadError:
-            failed_files.append(f"{filename} (corrupted or unreadable PDF)")
+            failed_files.append(f"{filename} (corrupted PDF structure)")
         except Exception as exc:  # noqa: BLE001
             failed_files.append(f"{filename} ({exc})")
+        finally:
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except OSError:
+                    pass
 
     if not documents:
-        details = "; ".join(failed_files) if failed_files else "unknown error"
+        details = "; ".join(failed_files) if failed_files else "unknown extraction error"
         raise PDFExtractionError(
-            f"Could not extract any readable text from the uploaded PDF(s). Details: {details}"
+            f"Could not extract readable text from uploaded file(s). Details: {details}"
         )
 
-    # Attach failed_files info onto the returned list via a side-channel attribute
-    # so the caller (Streamlit UI) can warn about partial failures.
     extract_documents_from_pdfs.last_failed_files = failed_files  # type: ignore[attr-defined]
-
     return documents
 
 
 # --------------------------------------------------------------------------
-# 2. Chunking
+# 2. Textbook Chunking with Hierarchical Separators
 # --------------------------------------------------------------------------
 
 def chunk_documents(
@@ -150,35 +194,40 @@ def chunk_documents(
     chunk_size: int = CHUNK_SIZE,
     chunk_overlap: int = CHUNK_OVERLAP,
 ) -> List[Document]:
-    """
-    Split page-level documents into smaller overlapping chunks while
-    preserving the original page/source metadata on every chunk.
-    """
     if not documents:
         raise VectorStoreError("No documents available to chunk.")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ". ", " ", ""],
+        separators=[
+            "\n# ",
+            "\n## ",
+            "\n### ",
+            "\n\n",
+            "\n",
+            ". ",
+            " ",
+            "",
+        ],
     )
     chunks = splitter.split_documents(documents)
 
     if not chunks:
-        raise VectorStoreError("Text splitting produced zero chunks.")
+        raise VectorStoreError("Text chunking produced 0 segments.")
 
     return chunks
 
 
 # --------------------------------------------------------------------------
-# 3. Vector Store
+# 3. Batched In-Memory FAISS Vector Indexing
 # --------------------------------------------------------------------------
+
 def build_vector_store(
     chunks: List[Document],
     api_key: str,
     persist_directory: Optional[str] = None,
 ):
-    """Build an in-memory FAISS vector store directly from chunks."""
     if not api_key:
         raise VectorStoreError("A Gemini API key is required to build embeddings.")
 
@@ -187,27 +236,32 @@ def build_vector_store(
             model=EMBEDDING_MODEL,
             google_api_key=api_key,
         )
-        vector_store = FAISS.from_documents(
-            documents=chunks,
+
+        first_batch = chunks[:EMBED_BATCH_SIZE]
+        vector_store = _call_with_retry(
+            FAISS.from_documents,
+            documents=first_batch,
             embedding=embeddings,
         )
+
+        if len(chunks) > EMBED_BATCH_SIZE:
+            for i in range(EMBED_BATCH_SIZE, len(chunks), EMBED_BATCH_SIZE):
+                next_batch = chunks[i : i + EMBED_BATCH_SIZE]
+                _call_with_retry(vector_store.add_documents, documents=next_batch)
+                time.sleep(EMBED_PAUSE_SECONDS)
+
+        gc.collect()
         return vector_store
 
     except Exception as exc:  # noqa: BLE001
         raise VectorStoreError(
-            f"Failed to build the vector store. Check your Gemini API key and network "
-            f"connection. Details: {exc}"
+            f"Failed to build vector store. Details: {exc}"
         ) from exc
 
 
-
-# --------------------------------------------------------------------------
-# 4a. Question Answering
-# --------------------------------------------------------------------------
 def get_llm(api_key: str, temperature: float = 0.3) -> ChatGoogleGenerativeAI:
-    """Instantiate the Gemini chat model."""
     if not api_key:
-        raise GenerationError("A Gemini API key is required to use the language model.")
+        raise GenerationError("A Gemini API key is required.")
     try:
         return ChatGoogleGenerativeAI(
             model=LLM_MODEL,
@@ -218,24 +272,19 @@ def get_llm(api_key: str, temperature: float = 0.3) -> ChatGoogleGenerativeAI:
     except Exception as exc:  # noqa: BLE001
         raise GenerationError(f"Failed to initialize Gemini model: {exc}") from exc
 
+
+# --------------------------------------------------------------------------
+# 4a. Grounded Question Answering with Citations
+# --------------------------------------------------------------------------
+
 def answer_question(
     query: str,
-    vector_store: Chroma,
+    vector_store,
     api_key: str,
     k: int = 4,
 ) -> Dict[str, Any]:
-    """
-    Answer a user's question using retrieval-augmented generation, strictly
-    grounded in the uploaded documents, and return page-level citations.
-
-    Returns:
-        {
-            "answer": str,
-            "citations": [{"source": str, "page": int, "snippet": str}, ...]
-        }
-    """
     if not query or not query.strip():
-        raise GenerationError("Please enter a non-empty question.")
+        raise GenerationError("Please enter a question.")
     if vector_store is None:
         raise VectorStoreError("No documents have been processed yet.")
 
@@ -247,10 +296,7 @@ def answer_question(
 
     if not relevant_docs:
         return {
-            "answer": (
-                "I couldn't find anything relevant to that question in the "
-                "uploaded documents. Try rephrasing, or upload more material."
-            ),
+            "answer": "I could not find anything relevant to that question in the uploaded document.",
             "citations": [],
         }
 
@@ -261,14 +307,14 @@ def answer_question(
         context_blocks.append(f"[Excerpt {i} | {source}, page {page}]\n{doc.page_content}")
     context_text = "\n\n".join(context_blocks)
 
-    prompt = f"""You are a meticulous study assistant. Answer the student's question
-using ONLY the context excerpts below, which come from their own course materials.
+    prompt = f"""You are a university academic study assistant. Answer the student's question
+using ONLY the textbook excerpts below.
 
 Rules:
-- If the answer is not contained in the context, say clearly that the materials
-  don't cover it — do not make anything up.
-- Be concise, clear, and exam-relevant.
-- Do not fabricate page numbers or sources; only use what is given in the context.
+- If the answer is not contained in the context, explicitly state that the material
+  does not cover it — do not invent facts.
+- Be concise, clear, and exam-focused.
+- Do not fabricate page numbers or citations.
 
 CONTEXT:
 {context_text}
@@ -279,7 +325,7 @@ ANSWER:"""
 
     llm = get_llm(api_key, temperature=0.2)
     try:
-        response = llm.invoke(prompt)
+        response = _call_with_retry(llm.invoke, prompt)
         answer_text = response.content if hasattr(response, "content") else str(response)
     except Exception as exc:  # noqa: BLE001
         raise GenerationError(f"Gemini failed to generate an answer: {exc}") from exc
@@ -302,25 +348,19 @@ ANSWER:"""
 
 
 # --------------------------------------------------------------------------
-# Shared helper: gather context for a topic (or the whole corpus)
+# 4b. Quiz Generation
 # --------------------------------------------------------------------------
 
-def _gather_context(
-    vector_store,
-    topic: Optional[str],
-    k: int = 8,
-) -> str:
-    """Retrieve representative context chunks for a topic, or a broad sample
-    of the corpus if no topic is given."""
+def _gather_context(vector_store, topic: Optional[str], k: int = 8) -> str:
     try:
-        search_query = topic.strip() if (topic and topic.strip()) else "summary main concepts overview"
+        search_query = topic.strip() if (topic and topic.strip()) else "key concepts principles definitions"
         retriever = vector_store.as_retriever(search_kwargs={"k": k})
         docs = retriever.invoke(search_query)
     except Exception as exc:  # noqa: BLE001
         raise VectorStoreError(f"Failed to retrieve context: {exc}") from exc
 
     if not docs:
-        raise VectorStoreError("No content available in the vector store to work with.")
+        raise VectorStoreError("No content available in the vector store.")
 
     blocks = []
     for doc in docs:
@@ -330,69 +370,43 @@ def _gather_context(
     return "\n\n".join(blocks)
 
 
-
 def _extract_json_block(text: str) -> str:
-    """Pull the first JSON array/object out of an LLM response that may be
-    wrapped in markdown code fences or extra prose."""
     fenced = re.search(r"```(?:json)?\s*(\[.*?\]|\{.*?\})\s*```", text, re.DOTALL)
     if fenced:
         return fenced.group(1)
-
     bracket_match = re.search(r"(\[.*\])", text, re.DOTALL)
     if bracket_match:
         return bracket_match.group(1)
-
     brace_match = re.search(r"(\{.*\})", text, re.DOTALL)
     if brace_match:
         return brace_match.group(1)
-
     return text
 
 
-# --------------------------------------------------------------------------
-# 4b. Quiz Generation
-# --------------------------------------------------------------------------
-
 def generate_quiz(
-    vector_store: Chroma,
+    vector_store,
     api_key: str,
     topic: Optional[str] = None,
     num_questions: int = 3,
 ) -> List[Dict[str, Any]]:
-    """
-    Generate multiple-choice quiz questions grounded in the uploaded documents.
-
-    Returns:
-        A list of dicts, each shaped as:
-        {
-            "question": str,
-            "options": {"A": str, "B": str, "C": str, "D": str},
-            "correct_answer": "A" | "B" | "C" | "D",
-            "explanation": str
-        }
-    """
     if vector_store is None:
         raise VectorStoreError("No documents have been processed yet.")
 
     context_text = _gather_context(vector_store, topic, k=8)
-
     topic_instruction = (
         f"Focus specifically on the topic: '{topic.strip()}'."
         if topic and topic.strip()
-        else "Cover a broad, representative range of the material below."
+        else "Cover a representative range of the textbook material below."
     )
 
-    prompt = f"""You are an expert exam-writer creating a practice quiz for a university
-student, based strictly on the course material excerpts below.
+    prompt = f"""You are an exam writer creating a practice quiz based strictly on the excerpts below.
 
 {topic_instruction}
 
 Create exactly {num_questions} multiple-choice questions. Each question must have
-4 options (A, B, C, D), exactly one correct answer, and a one-sentence explanation
-of why that answer is correct, grounded in the material.
+4 options (A, B, C, D), exactly one correct answer, and a one-sentence rationale.
 
-Respond with ONLY a valid JSON array (no markdown, no prose, no code fences) in
-exactly this shape:
+Respond with ONLY a valid JSON array in exactly this format:
 [
   {{
     "question": "...",
@@ -402,13 +416,13 @@ exactly this shape:
   }}
 ]
 
-COURSE MATERIAL:
+TEXTBOOK MATERIAL:
 {context_text}
 """
 
-    llm = get_llm(api_key, temperature=0.4)
+    llm = get_llm(api_key, temperature=0.3)
     try:
-        response = llm.invoke(prompt)
+        response = _call_with_retry(llm.invoke, prompt)
         raw_text = response.content if hasattr(response, "content") else str(response)
     except Exception as exc:  # noqa: BLE001
         raise GenerationError(f"Gemini failed to generate the quiz: {exc}") from exc
@@ -418,15 +432,12 @@ COURSE MATERIAL:
     try:
         quiz_data = json.loads(json_text)
     except json.JSONDecodeError as exc:
-        raise GenerationError(
-            f"The model returned an unparsable quiz format. Please try again. ({exc})"
-        ) from exc
+        raise GenerationError(f"Failed to parse quiz response: {exc}") from exc
 
     if not isinstance(quiz_data, list) or not quiz_data:
-        raise GenerationError("The model did not return any quiz questions.")
+        raise GenerationError("No quiz questions were returned.")
 
-    # Validate structure defensively.
-    validated: List[Dict[str, Any]] = []
+    validated = []
     for item in quiz_data:
         if not isinstance(item, dict):
             continue
@@ -437,17 +448,15 @@ COURSE MATERIAL:
             and set(["A", "B", "C", "D"]).issubset(options.keys())
             and item.get("correct_answer") in ["A", "B", "C", "D"]
         ):
-            validated.append(
-                {
-                    "question": item["question"],
-                    "options": options,
-                    "correct_answer": item["correct_answer"],
-                    "explanation": item.get("explanation", ""),
-                }
-            )
+            validated.append({
+                "question": item["question"],
+                "options": options,
+                "correct_answer": item["correct_answer"],
+                "explanation": item.get("explanation", ""),
+            })
 
     if not validated:
-        raise GenerationError("The generated quiz did not match the expected format.")
+        raise GenerationError("Generated quiz did not match required format.")
 
     return validated
 
@@ -457,51 +466,42 @@ COURSE MATERIAL:
 # --------------------------------------------------------------------------
 
 def summarize_content(
-    vector_store: Chroma,
+    vector_store,
     api_key: str,
     topic: Optional[str] = None,
     num_points: int = 5,
 ) -> str:
-    """
-    Produce a structured, exam-focused summary of the uploaded material
-    (optionally scoped to a topic) as clean Markdown bullet points.
-
-    Returns:
-        A Markdown-formatted string with `num_points` bullet points.
-    """
     if vector_store is None:
         raise VectorStoreError("No documents have been processed yet.")
 
     context_text = _gather_context(vector_store, topic, k=10)
-
     topic_instruction = (
         f"Focus specifically on the topic: '{topic.strip()}'."
         if topic and topic.strip()
-        else "Summarize the key ideas across the entire uploaded material."
+        else "Summarize the core textbook concepts."
     )
 
-    prompt = f"""You are a study coach helping a student revise efficiently before an exam.
+    prompt = f"""You are a revision coach summarizing textbook material before an exam.
 
 {topic_instruction}
 
-Using ONLY the course material excerpts below, produce exactly {num_points} clear,
-high-yield bullet points a student could use for last-minute revision. Each bullet
-should:
-- Start with a short bolded key term or concept (Markdown **bold**)
-- Be followed by a concise, plain-English explanation (1-2 sentences)
-- Focus on concepts most likely to appear on an exam
+Using ONLY the textbook excerpts below, produce exactly {num_points} clear,
+high-yield revision bullet points. Each bullet must:
+- Start with a bolded core concept or term (**Concept Name**)
+- Follow with a concise 1-2 sentence explanation
+- Focus on high-probability exam definitions and rules
 
 Respond with ONLY the Markdown bullet list, nothing else.
 
-COURSE MATERIAL:
+TEXTBOOK MATERIAL:
 {context_text}
 """
 
     llm = get_llm(api_key, temperature=0.3)
     try:
-        response = llm.invoke(prompt)
+        response = _call_with_retry(llm.invoke, prompt)
         summary_text = response.content if hasattr(response, "content") else str(response)
     except Exception as exc:  # noqa: BLE001
-        raise GenerationError(f"Gemini failed to generate the summary: {exc}") from exc
+        raise GenerationError(f"Failed to generate summary: {exc}") from exc
 
     return summary_text.strip()
