@@ -36,7 +36,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 # Constants
 # --------------------------------------------------------------------------
 
-EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_MODEL = "models/gemini-embedding-001"
 LLM_MODEL = "gemini-1.5-flash"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
