@@ -204,6 +204,19 @@ def build_vector_store(
 # --------------------------------------------------------------------------
 # 4a. Question Answering
 # --------------------------------------------------------------------------
+def get_llm(api_key: str, temperature: float = 0.3) -> ChatGoogleGenerativeAI:
+    """Instantiate the Gemini chat model."""
+    if not api_key:
+        raise GenerationError("A Gemini API key is required to use the language model.")
+    try:
+        return ChatGoogleGenerativeAI(
+            model=LLM_MODEL,
+            google_api_key=api_key,
+            temperature=temperature,
+            convert_system_message_to_human=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise GenerationError(f"Failed to initialize Gemini model: {exc}") from exc
 
 def answer_question(
     query: str,
