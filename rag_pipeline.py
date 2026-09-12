@@ -181,19 +181,7 @@ def build_vector_store(
     persist_directory: Optional[str] = None,
 ) -> Chroma:
     """
-    Build a Chroma vector store from document chunks using Gemini embeddings.
-
-    Args:
-        chunks: list of chunked Document objects.
-        api_key: Gemini API key.
-        persist_directory: optional path for on-disk persistence. If None,
-            an in-memory (ephemeral) Chroma collection is created.
-
-    Returns:
-        A Chroma vector store instance ready for similarity search.
-
-    Raises:
-        VectorStoreError: on embedding or index-build failure (e.g. bad API key).
+    Build an in-memory Chroma vector store directly from chunks.
     """
     if not api_key:
         raise VectorStoreError("A Gemini API key is required to build embeddings.")
@@ -204,20 +192,10 @@ def build_vector_store(
             google_api_key=api_key,
         )
 
-        # Unique collection name avoids collisions across repeated runs in the
-        # same Streamlit session / Chroma client.
-        collection_name = f"study_assistant_{uuid.uuid4().hex[:8]}"
-
-        chroma_client = chromadb.EphemeralClient()
-
-        kwargs: Dict[str, Any] = {
-            "documents": chunks,
-            "embedding": embeddings,
-            "collection_name": collection_name,
-            "client": chroma_client,
-        }
-
-        vector_store = Chroma.from_documents(**kwargs)
+        vector_store = Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+        )
         return vector_store
 
     except Exception as exc:  # noqa: BLE001
@@ -225,7 +203,6 @@ def build_vector_store(
             f"Failed to build the vector store. Check your Gemini API key and network "
             f"connection. Details: {exc}"
         ) from exc
-
 
 def get_llm(api_key: str, temperature: float = 0.3) -> ChatGoogleGenerativeAI:
     """Instantiate the Gemini chat model."""
