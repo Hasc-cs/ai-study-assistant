@@ -28,8 +28,8 @@ from pypdf.errors import PdfReadError
 
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
 import chromadb
+from langchain_community.vectorstores import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
 # --------------------------------------------------------------------------
@@ -198,7 +198,7 @@ def build_vector_store(
     if not api_key:
         raise VectorStoreError("A Gemini API key is required to build embeddings.")
 
-     try:
+    try:
         embeddings = GoogleGenerativeAIEmbeddings(
             model=EMBEDDING_MODEL,
             google_api_key=api_key,
