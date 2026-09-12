@@ -341,17 +341,9 @@ def _gather_context(
     """Retrieve representative context chunks for a topic, or a broad sample
     of the corpus if no topic is given."""
     try:
-        if topic and topic.strip():
-            retriever = vector_store.as_retriever(search_kwargs={"k": k})
-            docs = retriever.invoke(topic)
-        else:
-            # No topic: pull a broad sample of the whole collection.
-            collection = vector_store.get()
-            documents_raw = collection.get("documents", []) or []
-            metadatas_raw = collection.get("metadatas", []) or []
-            docs = []
-            for text, meta in list(zip(documents_raw, metadatas_raw))[:k]:
-                docs.append(Document(page_content=text, metadata=meta or {}))
+        search_query = topic.strip() if (topic and topic.strip()) else "summary main concepts overview"
+        retriever = vector_store.as_retriever(search_kwargs={"k": k})
+        docs = retriever.invoke(search_query)
     except Exception as exc:  # noqa: BLE001
         raise VectorStoreError(f"Failed to retrieve context: {exc}") from exc
 
@@ -364,6 +356,7 @@ def _gather_context(
         page = doc.metadata.get("page", "?")
         blocks.append(f"[{source}, page {page}]\n{doc.page_content}")
     return "\n\n".join(blocks)
+
 
 
 def _extract_json_block(text: str) -> str:
