@@ -3,15 +3,12 @@ rag_pipeline.py
 ----------------
 High-Capacity Backend RAG Pipeline for Large Documents (up to 100 MB).
 
-Optimizations for 100 MB PDFs:
-1. Disk-backed streaming: Uses temporary files instead of loading 100 MB
-   byte buffers directly into RAM, preventing Streamlit Cloud OOM crashes.
-2. Garbage collection & memory cleanup: Frees memory page-by-page.
-3. Safe page processing: Handles large page counts gracefully with progress
-   tracking and non-blocking text extraction.
-4. Quota-safe pacing: Batches embeddings in increments of 30 with pacing
-   delays to stay within Google's free-tier 100 RPM quota.
-5. In-Memory FAISS: Eliminates SQLite file lock issues completely.
+Fixes applied:
+1. Embedding Model: Uses 'models/gemini-embedding-001' (the active, supported model).
+2. LLM Model: Uses 'gemini-1.5-flash' for high-quota reliability (1,500 requests/day).
+3. Disk-backed streaming: Uses temporary files to prevent Streamlit Cloud OOM crashes.
+4. Garbage collection & memory cleanup: Frees memory page-by-page.
+5. In-Memory FAISS: Eliminates SQLite table locking errors.
 """
 
 import gc
@@ -35,7 +32,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 # Configuration Constants
 # --------------------------------------------------------------------------
 
-EMBEDDING_MODEL = "models/embedding-001"
+# 'models/gemini-embedding-001' is the officially active model on v1beta
+EMBEDDING_MODEL = "models/gemini-embedding-001"
 LLM_MODEL = "gemini-1.5-flash"
 
 CHUNK_SIZE = 2000
@@ -101,7 +99,7 @@ class GenerationError(Exception):
 
 
 # --------------------------------------------------------------------------
-# 1. Memory-Safe 100 MB PDF Extraction
+# 1. Memory-Safe PDF Extraction
 # --------------------------------------------------------------------------
 
 def extract_documents_from_pdfs(
@@ -186,7 +184,7 @@ def extract_documents_from_pdfs(
 
 
 # --------------------------------------------------------------------------
-# 2. Textbook Chunking with Hierarchical Separators
+# 2. Text Chunking
 # --------------------------------------------------------------------------
 
 def chunk_documents(
