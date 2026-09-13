@@ -29,15 +29,14 @@ from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
 # --------------------------------------------------------------------------
-# Configuration Constants
+# Constants
 # --------------------------------------------------------------------------
 
-# 'models/gemini-embedding-001' is the officially active model on v1beta
 EMBEDDING_MODEL = "models/gemini-embedding-001"
-LLM_MODEL = "gemini-1.5-flash"
-
+LLM_MODEL = "gemini-3.8-flash"
 CHUNK_SIZE = 2000
 CHUNK_OVERLAP = 200
+
 
 EMBED_BATCH_SIZE = 30
 EMBED_PAUSE_SECONDS = 0.5
